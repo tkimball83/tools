@@ -103,7 +103,8 @@ def main() -> int:
     cwd = Path.cwd()
     is_tty = sys.stderr.isatty()
     done = 0
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+    pool = ThreadPoolExecutor(max_workers=WORKERS)
+    try:
         futures = {pool.submit(probe_languages, file): file for file in files}
         for future in as_completed(futures):
             file = futures[future]
@@ -126,18 +127,20 @@ def main() -> int:
                 except ValueError:
                     label = str(file)
                 rows.append((label, default_lang, ",".join(languages) or "-"))
-    if is_tty:
-        print("\r\033[K", end="", file=sys.stderr)
+    finally:
+        pool.shutdown(cancel_futures=True)
+        if is_tty:
+            print("\r\033[K", end="", file=sys.stderr)
     rows.sort()
 
     if rows:
         table = tabulate(
             rows, headers=["File", "Default", "Languages"], tablefmt="simple"
         )
-        print(f"\n{table}\n")
+        print(f"\n{table}\n", flush=True)
 
     status(
-        f"Scanned {scanned} video file(s), skipped {skipped} non-video, flagged {len(rows)}."
+        f"Scanned {scanned} video file(s), skipped {skipped} without video or audio, flagged {len(rows)}."
     )
     return 1 if errors else 0
 

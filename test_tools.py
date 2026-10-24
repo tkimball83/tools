@@ -2,7 +2,9 @@
 """Assert-based self-checks: venv/bin/python test_tools.py"""
 
 import importlib.util
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -14,6 +16,23 @@ def load(path):
     spec.loader.exec_module(module)
     return module
 
+
+# A closed stdout pipe exits quietly with 128 + SIGPIPE
+PIPE_SCRIPT = (
+    "import sys; sys.path.insert(0, sys.argv[1]); from lib.runtime import run;"
+    " run(lambda: print('x' * 1_000_000))"
+)
+read_end, write_end = os.pipe()
+os.close(read_end)
+piped = subprocess.run(
+    [sys.executable, "-c", PIPE_SCRIPT, str(ROOT)],
+    stdout=write_end,
+    stderr=subprocess.PIPE,
+    text=True,
+    check=False,
+)
+os.close(write_end)
+assert (piped.returncode, piped.stderr) == (141, ""), piped
 
 check_language = load(ROOT / "video" / "check_language.py")
 compare = load(ROOT / "rpm" / "compare.py")
