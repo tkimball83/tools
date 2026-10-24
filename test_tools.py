@@ -84,12 +84,28 @@ assert compare.gather_packages("host") == {
     "epoch.noarch": {"2.0-3"},
 }
 
+assert sorted(
+    ["5.14.0-70.el9", "5.14.0-611.el9", "5.14.0-570.el9"], key=compare.version_key
+) == ["5.14.0-70.el9", "5.14.0-570.el9", "5.14.0-611.el9"]
+
 compare.subprocess.run = fake_run("garbage without a tab\n")
 try:
     compare.gather_packages("host")
     raise AssertionError("malformed output should raise")
 except RuntimeError:
     pass
+
+
+def timeout_run(*_, **__):
+    raise subprocess.TimeoutExpired("ssh", compare.SSH_TIMEOUT)
+
+
+compare.subprocess.run = timeout_run
+try:
+    compare.gather_packages("host")
+    raise AssertionError("timeout should raise")
+except RuntimeError as exc:
+    assert str(exc) == f"timed out after {compare.SSH_TIMEOUT}s"
 
 compare.subprocess.run = fake_run("", returncode=255)
 try:
