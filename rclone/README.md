@@ -22,10 +22,12 @@ A YAML-controlled bash script to sync between multiple rclone remotes.
 | `-c` | `null`                    | Change path to rclone config        |
 | `-d` | `false`                   | Enable rclone dry run               |
 | `-f` | `tree.yaml`               | Change path to script config YAML   |
+| `-h` |                           | Show help and exit                  |
 | `-k` | `32`                      | Change rclone checkers setting      |
 | `-l` | `0`                       | Change rclone bandwidth limit       |
 | `-s` | `shyaml`                  | Change path to shyaml binary        |
 | `-t` | `16`                      | Change rclone transfers setting     |
+| `-v` | `false`                   | Enable rclone verbose (`-vv` debug) |
 
 If `-c` is not provided, the script uses the first existing config at:
 `~/.config/rclone/rclone.conf`, then `/etc/rclone/rclone.conf`.
@@ -33,6 +35,8 @@ If `-c` is not provided, the script uses the first existing config at:
 ## Examples
 
     ./tree.sh -d
+    ./tree.sh -v
+    ./tree.sh -dvv
     ./tree.sh -2
     ./tree.sh -k 16
     ./tree.sh -l 100M
