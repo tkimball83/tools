@@ -28,7 +28,7 @@ Usage: $(basename -- "${0}") [options]
 Options:
   -2          Enable HTTP/2 for rclone
   -b <path>   Path to rclone binary (default: rclone)
-  -c <path>   Path to rclone config (default: first found config)
+  -c <path>   Path to rclone config (default: \$RCLONE_CONFIG or first found)
   -d          Enable rclone dry run
   -f <path>   Path to tree YAML (default: ${SCRIPT_DIR}/tree.yaml)
   -h          Show this help
@@ -55,11 +55,15 @@ function rclone_sync() {
   local source="${1}"
   local destination="${2}"
   local -a command=("${RCLONE_BIN}" sync "${RCLONE_ARGS[@]}" "${source}" "${destination}")
+  local status=0
 
   output_command "${command[@]}"
   echo
 
-  "${command[@]}"
+  "${command[@]}" || status=$?
+  echo
+
+  return "${status}"
 }
 
 function require_command() {
@@ -121,11 +125,11 @@ function yaml_value() {
 RCLONE_BIN=rclone
 RCLONE_BWLIMIT=0
 RCLONE_CHECKERS=32
-RCLONE_CONFIG=
+RCLONE_CONFIG=${RCLONE_CONFIG-}
 RCLONE_DRY_RUN=false
 RCLONE_ENABLE_HTTP2=false
-RCLONE_TRANSFERS=16
 RCLONE_PROGRESS=true
+RCLONE_TRANSFERS=16
 RCLONE_VERBOSE=
 SHYAML_BIN=shyaml
 TREE_YAML="${SCRIPT_DIR}/tree.yaml"
@@ -206,13 +210,14 @@ declare -a RCLONE_ARGS=(
 tree_length=$(yaml_length tree)
 ((tree_length > 0)) || fail "The rclone tree list is empty."
 
-trap 'fail "Interrupted."' INT TERM
+trap 'echo >&2; output "ERROR: Interrupted." >&2; exit 130' INT TERM
 
 failures=0
 syncs=0
 
 for ((t = 0; t < tree_length; t++)); do
   trunk=$(yaml_value "tree.${t}.trunk")
+  trunk=${trunk%:}
   branch_length=$(yaml_length "tree.${t}.branches")
 
   if [[ -z "${trunk}" ]]; then
@@ -227,8 +232,7 @@ for ((t = 0; t < tree_length; t++)); do
 
   for ((b = 0; b < branch_length; b++)); do
     branch=$(yaml_value "tree.${t}.branches.${b}.name")
-    leafs_key="tree.${t}.branches.${b}.leafs"
-    leafs_type=$(yaml_type "${leafs_key}")
+    branch=${branch%:}
 
     if [[ -z "${branch}" ]]; then
       warn "The rclone branch has no name in ${trunk}, skipping."
@@ -240,6 +244,9 @@ for ((t = 0; t < tree_length; t++)); do
       continue
     fi
 
+    leafs_key="tree.${t}.branches.${b}.leafs"
+    leafs_type=$(yaml_type "${leafs_key}")
+
     # Only a missing leafs key syncs the whole remote; a malformed one is skipped.
     if [[ -z "${leafs_type}" ]]; then
       syncs=$((syncs + 1))
@@ -247,23 +254,32 @@ for ((t = 0; t < tree_length; t++)); do
       continue
     fi
 
-    if [[ "${leafs_type}" != sequence ]] || (($(yaml_length "${leafs_key}") == 0)); then
+    leafs=()
+
+    if [[ "${leafs_type}" == sequence ]]; then
+      while IFS= read -r -d '' leaf; do
+        leafs+=("${leaf}")
+      done < <(yaml get-values-0 "${leafs_key}")
+    fi
+
+    if ((${#leafs[@]} == 0)); then
       warn "The rclone leafs for ${trunk} -> ${branch} must be a non-empty list, skipping."
       continue
     fi
 
-    while IFS= read -r -d '' leaf; do
+    for leaf in "${leafs[@]}"; do
       if [[ -z "${leaf}" ]]; then
         warn "The rclone leaf is not defined in ${trunk} -> ${branch}, skipping."
         continue
       fi
 
       syncs=$((syncs + 1))
-      rclone_sync "${trunk}:${leaf}" "${branch}:${leaf}" </dev/null || failures=$((failures + 1))
-    done < <(yaml get-values-0 "${leafs_key}")
+      rclone_sync "${trunk}:${leaf}" "${branch}:${leaf}" || failures=$((failures + 1))
+    done
   done
 done
 
+((syncs > 0)) || fail "No rclone sync commands were run."
 ((failures == 0)) || fail "${failures} of ${syncs} rclone sync command(s) failed."
 
 output "Completed ${syncs} rclone sync command(s)."
