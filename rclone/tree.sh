@@ -1,32 +1,59 @@
 #!/usr/bin/env bash
-set -u
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+declare -a RCLONE_CONFIG_PATHS=(
+  "${HOME}/.config/rclone/rclone.conf"
+  "/etc/rclone/rclone.conf"
+)
+
+function output() {
+  printf '[*]: %s\n' "${1}"
+}
+
+function warn() {
+  output "WARNING: ${1}" >&2
+}
 
 function fail() {
   output "ERROR: ${1}" >&2
   exit 1
 }
 
-function output() {
-  printf '[*]: %s\n' "${1}"
+function usage() {
+  cat <<EOF
+Usage: $(basename -- "${0}") [options]
+
+Options:
+  -2          Enable HTTP/2 for rclone
+  -b <path>   Path to rclone binary (default: rclone)
+  -c <path>   Path to rclone config (default: first found config)
+  -d          Enable rclone dry run
+  -f <path>   Path to tree YAML (default: ${SCRIPT_DIR}/tree.yaml)
+  -h          Show this help
+  -k <count>  rclone checkers (default: 32)
+  -l <limit>  rclone bandwidth limit (default: 0)
+  -s <path>   Path to shyaml binary (default: shyaml)
+  -t <count>  rclone transfers (default: 16)
+  -v          Enable rclone verbose output (repeat for more, e.g. -vv)
+EOF
 }
 
 function output_command() {
-  local -a command=("$@")
   local argument
 
-  output "${command[0]} ${command[1]}"
+  output "${1} ${2}"
 
-  for argument in "${command[@]:2}"; do
+  for argument in "${@:3}"; do
     output "  ${argument}"
   done
 }
 
-function rclone_exec() {
-  local trunk="${1}"
-  local branch="${2}"
-  local -a command
-
-  command=("${RCLONE_BIN}" sync "${RCLONE_ARGS[@]}" "${trunk}" "${branch}")
+function rclone_sync() {
+  local source="${1}"
+  local destination="${2}"
+  local -a command=("${RCLONE_BIN}" sync "${RCLONE_ARGS[@]}" "${source}" "${destination}")
 
   output_command "${command[@]}"
   echo
@@ -38,20 +65,21 @@ function require_command() {
   local command_path="${1}"
 
   if [[ "${command_path}" == */* ]]; then
-    if [[ ! -x "${command_path}" ]]; then
-      fail "Unable to execute ${command_path}."
-    fi
+    [[ -x "${command_path}" ]] || fail "Unable to execute ${command_path}."
   else
-    if ! command -v "${command_path}" >/dev/null 2>&1; then
-      fail "Unable to locate ${command_path}."
-    fi
+    command -v "${command_path}" >/dev/null 2>&1 || fail "Unable to locate ${command_path}."
   fi
 }
 
 function require_file() {
-  local file_path="${1}"
+  [[ -f "${1}" ]] || fail "Unable to locate ${1}."
+}
 
-  [[ -f "${file_path}" ]] || fail "Unable to locate ${file_path}."
+function require_positive_integer() {
+  local name="${1}"
+  local value="${2}"
+
+  [[ "${value}" =~ ^[1-9][0-9]*$ ]] || fail "The ${name} value must be a positive integer: ${value}"
 }
 
 function resolve_rclone_config() {
@@ -67,52 +95,73 @@ function resolve_rclone_config() {
   return 1
 }
 
-function yaml_length() {
-  local key="${1}"
+function yaml() {
+  "${SHYAML_BIN}" "$@" <<<"${TREE_DATA}" 2>/dev/null
+}
 
-  "${SHYAML_BIN}" get-length "${key}" <"${TREE_YAML}" 2>/dev/null
+function yaml_length() {
+  local length
+
+  length=$(yaml get-length "${1}")
+
+  [[ "${length}" =~ ^[0-9]+$ ]] || length=0
+
+  printf '%s\n' "${length}"
+}
+
+function yaml_type() {
+  yaml get-type "${1}"
 }
 
 function yaml_value() {
-  local key="${1}"
-
-  "${SHYAML_BIN}" get-value "${key}" <"${TREE_YAML}" 2>/dev/null
+  yaml get-value "${1}"
 }
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+RCLONE_BIN=rclone
+RCLONE_BWLIMIT=0
+RCLONE_CHECKERS=32
+RCLONE_CONFIG=
+RCLONE_DRY_RUN=false
+RCLONE_ENABLE_HTTP2=false
+RCLONE_TRANSFERS=16
+RCLONE_VERBOSE=
+SHYAML_BIN=shyaml
+TREE_YAML="${SCRIPT_DIR}/tree.yaml"
 
-while getopts "2b:c:df:k:l:s:t:" opt; do
-  case $opt in
-    2) enable_http2=true ;;
-    b) rclone_bin=$OPTARG ;;
-    c) rclone_config=$OPTARG ;;
-    d) dry_run=true ;;
-    f) tree_yaml=$OPTARG ;;
-    k) rclone_checkers=$OPTARG ;;
-    l) rclone_bwlimit=$OPTARG ;;
-    s) shyaml_bin=$OPTARG ;;
-    t) rclone_transfers=$OPTARG ;;
-    *) exit 1 ;;
+while getopts ":2b:c:df:hk:l:s:t:v" opt; do
+  case "${opt}" in
+    2) RCLONE_ENABLE_HTTP2=true ;;
+    b) RCLONE_BIN=${OPTARG} ;;
+    c) RCLONE_CONFIG=${OPTARG} ;;
+    d) RCLONE_DRY_RUN=true ;;
+    f) TREE_YAML=${OPTARG} ;;
+    h)
+      usage
+      exit 0
+      ;;
+    k) RCLONE_CHECKERS=${OPTARG} ;;
+    l) RCLONE_BWLIMIT=${OPTARG} ;;
+    s) SHYAML_BIN=${OPTARG} ;;
+    t) RCLONE_TRANSFERS=${OPTARG} ;;
+    v) RCLONE_VERBOSE+=v ;;
+    :)
+      usage >&2
+      fail "Option -${OPTARG} requires an argument."
+      ;;
+    *)
+      usage >&2
+      fail "Invalid option: -${OPTARG}"
+      ;;
   esac
 done
+shift $((OPTIND - 1))
 
-RCLONE_BIN=${rclone_bin-rclone}
-RCLONE_BWLIMIT=${rclone_bwlimit-0}
-RCLONE_CHECKERS=${rclone_checkers-32}
-RCLONE_TRANSFERS=${rclone_transfers-16}
-SHYAML_BIN=${shyaml_bin-shyaml}
-TREE_YAML=${tree_yaml-"${SCRIPT_DIR}/tree.yaml"}
-DRY_RUN=${dry_run-false}
-ENABLE_HTTP2=${enable_http2-false}
+(($# == 0)) || {
+  usage >&2
+  fail "Unexpected argument(s): $*"
+}
 
-declare -a RCLONE_CONFIG_PATHS=(
-  "${HOME}/.config/rclone/rclone.conf"
-  "/etc/rclone/rclone.conf"
-)
-
-if [[ -n "${rclone_config-}" ]]; then
-  RCLONE_CONFIG=${rclone_config}
-else
+if [[ -z "${RCLONE_CONFIG}" ]]; then
   RCLONE_CONFIG=$(resolve_rclone_config) || fail "Unable to locate rclone config."
 fi
 
@@ -120,6 +169,11 @@ require_command "${RCLONE_BIN}"
 require_command "${SHYAML_BIN}"
 require_file "${RCLONE_CONFIG}"
 require_file "${TREE_YAML}"
+require_positive_integer checkers "${RCLONE_CHECKERS}"
+require_positive_integer transfers "${RCLONE_TRANSFERS}"
+
+# Read the tree once so edits made during a long run do not change it midway.
+TREE_DATA=$(<"${TREE_YAML}") || fail "Unable to read ${TREE_YAML}."
 
 declare -a RCLONE_ARGS=(
   "--bwlimit=${RCLONE_BWLIMIT}"
@@ -128,63 +182,73 @@ declare -a RCLONE_ARGS=(
   "--transfers=${RCLONE_TRANSFERS}"
 )
 
-[[ "${DRY_RUN}" = true ]] && RCLONE_ARGS+=(--dry-run)
-[[ "${ENABLE_HTTP2}" = false ]] && RCLONE_ARGS+=(--disable-http2)
+[[ "${RCLONE_DRY_RUN}" == true ]] && RCLONE_ARGS+=(--dry-run)
+[[ "${RCLONE_ENABLE_HTTP2}" == false ]] && RCLONE_ARGS+=(--disable-http2)
+[[ -n "${RCLONE_VERBOSE}" ]] && RCLONE_ARGS+=("-${RCLONE_VERBOSE}")
+
+[[ "$(yaml_type tree)" == sequence ]] || fail "Unable to parse a tree list from ${TREE_YAML}."
 
 tree_length=$(yaml_length tree)
+((tree_length > 0)) || fail "The rclone tree list is empty."
 
-if [[ ! "${tree_length}" =~ ^[0-9]+$ ]] || ((tree_length <= 0)); then
-  fail "The rclone tree list is empty."
-fi
+trap 'fail "Interrupted."' INT TERM
 
 failures=0
+syncs=0
 
 for ((t = 0; t < tree_length; t++)); do
-
   trunk=$(yaml_value "tree.${t}.trunk")
   branch_length=$(yaml_length "tree.${t}.branches")
 
   if [[ -z "${trunk}" ]]; then
-    output "WARNING: The rclone trunk is not defined, skipping." >&2
+    warn "The rclone trunk is not defined, skipping."
     continue
   fi
 
-  if [[ ! "${branch_length}" =~ ^[0-9]+$ ]] || ((branch_length <= 0)); then
-    output "WARNING: The rclone tree has no branches, skipping." >&2
+  if ((branch_length == 0)); then
+    warn "The rclone tree for ${trunk} has no branches, skipping."
     continue
   fi
 
   for ((b = 0; b < branch_length; b++)); do
-
     branch=$(yaml_value "tree.${t}.branches.${b}.name")
-    leaf_length=$(yaml_length "tree.${t}.branches.${b}.leafs")
+    leafs_key="tree.${t}.branches.${b}.leafs"
+    leafs_type=$(yaml_type "${leafs_key}")
 
     if [[ -z "${branch}" ]]; then
-      output "WARNING: The rclone branch has no name, skipping." >&2
+      warn "The rclone branch has no name in ${trunk}, skipping."
       continue
     fi
 
-    if [[ ! "${leaf_length}" =~ ^[0-9]+$ ]] || ((leaf_length <= 0)); then
-
-      rclone_exec "${trunk}:" "${branch}:" || ((failures++))
-
-    else
-      for ((l = 0; l < leaf_length; l++)); do
-
-        leaf=$(yaml_value "tree.${t}.branches.${b}.leafs.${l}")
-
-        if [[ -z "${leaf}" ]]; then
-          output "WARNING: The rclone leaf is not defined, skipping." >&2
-          continue
-        fi
-
-        rclone_exec "${trunk}:${leaf}" "${branch}:${leaf}" || ((failures++))
-
-      done
+    if [[ "${branch}" == "${trunk}" ]]; then
+      warn "The rclone branch ${branch} is the same as its trunk, skipping."
+      continue
     fi
+
+    # Only a missing leafs key syncs the whole remote; a malformed one is skipped.
+    if [[ -z "${leafs_type}" ]]; then
+      syncs=$((syncs + 1))
+      rclone_sync "${trunk}:" "${branch}:" || failures=$((failures + 1))
+      continue
+    fi
+
+    if [[ "${leafs_type}" != sequence ]] || (($(yaml_length "${leafs_key}") == 0)); then
+      warn "The rclone leafs for ${trunk} -> ${branch} must be a non-empty list, skipping."
+      continue
+    fi
+
+    while IFS= read -r -d '' leaf; do
+      if [[ -z "${leaf}" ]]; then
+        warn "The rclone leaf is not defined in ${trunk} -> ${branch}, skipping."
+        continue
+      fi
+
+      syncs=$((syncs + 1))
+      rclone_sync "${trunk}:${leaf}" "${branch}:${leaf}" </dev/null || failures=$((failures + 1))
+    done < <(yaml get-values-0 "${leafs_key}")
   done
 done
 
-if ((failures > 0)); then
-  fail "${failures} rclone sync command(s) failed."
-fi
+((failures == 0)) || fail "${failures} of ${syncs} rclone sync command(s) failed."
+
+output "Completed ${syncs} rclone sync command(s)."
