@@ -100,7 +100,6 @@ def main() -> int:
     files = sorted(set(files))
     total = len(files)
     status(f"Found {total} file(s) to check")
-    cwd = Path.cwd()
     is_tty = sys.stderr.isatty()
     done = 0
     pool = ThreadPoolExecutor(max_workers=WORKERS)
@@ -122,20 +121,16 @@ def main() -> int:
             scanned += 1
             default_lang, languages = probed
             if needs_attention(default_lang, languages):
-                try:
-                    label = str(file.relative_to(cwd))
-                except ValueError:
-                    label = str(file)
-                rows.append((label, default_lang, ",".join(languages) or "-"))
+                rows.append((default_lang, ",".join(languages) or "-", file.name))
     finally:
         pool.shutdown(cancel_futures=True)
         if is_tty:
             print("\r\033[K", end="", file=sys.stderr)
-    rows.sort()
+    rows.sort(key=lambda row: row[2])
 
     if rows:
         table = tabulate(
-            rows, headers=["File", "Default", "Languages"], tablefmt="simple"
+            rows, headers=["Default", "Languages", "File"], tablefmt="simple"
         )
         print(f"\n{table}\n", flush=True)
 
