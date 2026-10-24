@@ -128,6 +128,15 @@ RCLONE_VERBOSE=
 SHYAML_BIN=shyaml
 TREE_YAML="${SCRIPT_DIR}/tree.yaml"
 
+# These names are also rclone environment variables. Settings are passed as
+# flags, so keep them out of rclone's environment to avoid conflicting values.
+export -n RCLONE_BWLIMIT \
+  RCLONE_CHECKERS \
+  RCLONE_CONFIG \
+  RCLONE_DRY_RUN \
+  RCLONE_TRANSFERS \
+  RCLONE_VERBOSE
+
 while getopts ":2b:c:df:hk:l:s:t:v" opt; do
   case "${opt}" in
     2) RCLONE_ENABLE_HTTP2=true ;;
