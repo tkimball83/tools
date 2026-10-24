@@ -34,9 +34,10 @@ Options:
   -h          Show this help
   -k <count>  rclone checkers (default: 32)
   -l <limit>  rclone bandwidth limit (default: 0)
+  -q          Disable rclone verbose output
   -s <path>   Path to shyaml binary (default: shyaml)
   -t <count>  rclone transfers (default: 16)
-  -v          Enable rclone verbose output (repeat for more, e.g. -vv)
+  -v          rclone verbose level (default: -v, repeat for debug, e.g. -vv)
 EOF
 }
 
@@ -124,6 +125,7 @@ RCLONE_CONFIG=
 RCLONE_DRY_RUN=false
 RCLONE_ENABLE_HTTP2=false
 RCLONE_TRANSFERS=16
+RCLONE_QUIET=false
 RCLONE_VERBOSE=
 SHYAML_BIN=shyaml
 TREE_YAML="${SCRIPT_DIR}/tree.yaml"
@@ -137,7 +139,7 @@ export -n RCLONE_BWLIMIT \
   RCLONE_TRANSFERS \
   RCLONE_VERBOSE
 
-while getopts ":2b:c:df:hk:l:s:t:v" opt; do
+while getopts ":2b:c:df:hk:l:qs:t:v" opt; do
   case "${opt}" in
     2) RCLONE_ENABLE_HTTP2=true ;;
     b) RCLONE_BIN=${OPTARG} ;;
@@ -150,6 +152,7 @@ while getopts ":2b:c:df:hk:l:s:t:v" opt; do
       ;;
     k) RCLONE_CHECKERS=${OPTARG} ;;
     l) RCLONE_BWLIMIT=${OPTARG} ;;
+    q) RCLONE_QUIET=true ;;
     s) SHYAML_BIN=${OPTARG} ;;
     t) RCLONE_TRANSFERS=${OPTARG} ;;
     v) RCLONE_VERBOSE+=v ;;
@@ -169,6 +172,12 @@ shift $((OPTIND - 1))
   usage >&2
   fail "Unexpected argument(s): $*"
 }
+
+if [[ "${RCLONE_QUIET}" == true ]]; then
+  [[ -z "${RCLONE_VERBOSE}" ]] || fail "Options -q and -v cannot be combined."
+else
+  RCLONE_VERBOSE=${RCLONE_VERBOSE:-v}
+fi
 
 if [[ -z "${RCLONE_CONFIG}" ]]; then
   RCLONE_CONFIG=$(resolve_rclone_config) || fail "Unable to locate rclone config."
