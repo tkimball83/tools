@@ -30,18 +30,12 @@ A YAML-controlled bash script to sync between multiple rclone remotes.
 | `-t` | `16`                      | Change rclone transfers setting     |
 | `-v` | `false`                   | Enable rclone verbose (`-vv` debug) |
 
-Progress output is shown by default when running in a terminal, and is
-skipped automatically when output is redirected (e.g. cron or a log file).
-
-If `-c` is not provided, the script uses the first existing config at:
-`~/.config/rclone/rclone.conf`, then `/etc/rclone/rclone.conf`.
-
 ## Examples
 
     ./tree.sh -d
     ./tree.sh -q
     ./tree.sh -v
-    ./tree.sh -dvv
+    ./tree.sh -vv
     ./tree.sh -2
     ./tree.sh -k 16
     ./tree.sh -l 100M
