@@ -33,6 +33,8 @@ def run(main):
         except KeyboardInterrupt:
             code = 130
             status("Interrupted.")
+        except BrokenPipeError:
+            code = 141
         except SystemExit as exc:
             if isinstance(exc.code, int):
                 code = exc.code
