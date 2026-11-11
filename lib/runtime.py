@@ -6,20 +6,21 @@ import traceback
 from lib.output import hide_interrupt_echo, status
 
 
+class Terminated(SystemExit):
+    """Raised on SIGTERM; a SystemExit so `except Exception` cannot swallow it."""
+
+    def __init__(self):
+        super().__init__(143)
+
+
 def run(main):
     code = 1
 
-    def interrupt(*_):
-        nonlocal code
-        code = 130
-        raise KeyboardInterrupt
-
     def terminate(*_):
-        nonlocal code
-        code = 143
-        raise SystemExit(143)
+        raise Terminated
 
-    signal.signal(signal.SIGINT, interrupt)
+    # Restore Ctrl-C even if the parent started us with SIGINT ignored.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     signal.signal(signal.SIGTERM, terminate)
     try:
         try:
@@ -33,6 +34,9 @@ def run(main):
         except KeyboardInterrupt:
             code = 130
             status("Interrupted.")
+        except Terminated:
+            code = 143
+            status("Interrupted.")
         except BrokenPipeError:
             code = 141
         except SystemExit as exc:
@@ -43,9 +47,9 @@ def run(main):
             else:
                 code = 1
                 status(exc.code)
-        except BaseException:
+        except BaseException:  # noqa: BLE001 - report anything, then exit 1
+            # code stays 1; os._exit below would swallow a re-raise anyway.
             traceback.print_exc()
-            raise
         finally:
             signal.signal(signal.SIGINT, lambda *_: os._exit(130))
             signal.signal(signal.SIGTERM, lambda *_: os._exit(143))

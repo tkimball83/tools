@@ -3,5 +3,6 @@ pre-commit==4.7.0
 
 # runtime
 pymediainfo==7.0.1
+shyaml==0.6.2
 tabulate==0.10.0
 yaspin==3.5.1
