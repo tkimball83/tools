@@ -1,6 +1,7 @@
 # Makefile
 
-PYTHON ?= python3
+# The scripts need Python 3.14 or newer (see .python-version).
+PYTHON ?= python3.14
 
 .DELETE_ON_ERROR:
 .PHONY: all check clean lint pre-commit python venv
@@ -8,10 +9,10 @@ PYTHON ?= python3
 all: pre-commit
 
 check: python
-	venv/bin/python test_tools.py
+	venv/bin/python -m unittest discover -s tests -v
 
 clean:
-	$(RM) -r venv
+	$(RM) -r venv .ruff_cache __pycache__ */__pycache__
 
 lint: python
 	venv/bin/pre-commit run --all-files

@@ -1,4 +1,6 @@
+import os
 import shutil
+import signal
 import sys
 import termios
 from contextlib import contextmanager, suppress
@@ -28,22 +30,46 @@ def spinner(text):
             status(text)
 
 
+def _set_terminal(fd, attributes):
+    # A job moved to the background mid-run (Ctrl-Z, bg) is stopped by SIGTTOU
+    # when it changes terminal settings, unless SIGTTOU is ignored.
+    previous = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    try:
+        with suppress(OSError, termios.error):
+            termios.tcsetattr(fd, termios.TCSANOW, attributes)
+    finally:
+        signal.signal(signal.SIGTTOU, previous)
+
+
+def _get_terminal(fd):
+    try:
+        return termios.tcgetattr(fd)
+    except OSError, termios.error:
+        return None
+
+
 @contextmanager
 def hide_interrupt_echo():
+    """Stop the terminal echoing ^C while the body runs (main thread only)."""
     try:
         fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        new = old.copy()
-        new[3] &= ~termios.ECHOCTL
+        # Leave the terminal alone unless this is the foreground job.
+        foreground = os.tcgetpgrp(fd) == os.getpgrp()
+        old = termios.tcgetattr(fd) if foreground else None
     except AttributeError, ValueError, OSError, termios.error:
         old = None
     if old is None:
         yield
         return
+    new = old.copy()
+    new[3] &= ~termios.ECHOCTL
+    applied = None
     try:
-        with suppress(OSError, termios.error):
-            termios.tcsetattr(fd, termios.TCSANOW, new)
+        _set_terminal(fd, new)
+        applied = _get_terminal(fd)
         yield
     finally:
-        with suppress(OSError, termios.error):
-            termios.tcsetattr(fd, termios.TCSANOW, old)
+        # Restore only if nothing else changed the terminal meanwhile, such as
+        # a pager reading this output, whose settings must not be undone.
+        if applied is not None and _get_terminal(fd) == applied:
+            _set_terminal(fd, old)

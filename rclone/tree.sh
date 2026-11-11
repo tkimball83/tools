@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# The script's real directory, following symlinks (e.g. from ~/bin) and
+# ignoring CDPATH, which would otherwise make cd print the directory.
+function script_dir() {
+  local source="${BASH_SOURCE[0]}"
+  local dir
+
+  while [[ -L "${source}" ]]; do
+    dir=$(CDPATH='' cd -P -- "$(dirname -- "${source}")" && pwd)
+    source=$(readlink -- "${source}")
+    [[ "${source}" == /* ]] || source="${dir}/${source}"
+  done
+
+  CDPATH='' cd -P -- "$(dirname -- "${source}")" && pwd
+}
+
+SCRIPT_DIR=$(script_dir)
 
 declare -a RCLONE_CONFIG_PATHS=(
   "${HOME}/.config/rclone/rclone.conf"
@@ -19,6 +34,33 @@ function warn() {
 function fail() {
   output "ERROR: ${1}" >&2
   exit 1
+}
+
+function interrupted() {
+  local -a pids=()
+
+  # Stop the running sync too, rather than leaving it to finish on its own.
+  # rclone is the only background job, and jobs -p is right at any moment,
+  # unlike $!, which bash 3.2 cannot even read under set -u before a job.
+  read -r -d '' -a pids <<<"$(jobs -p)"
+  if ((${#pids[@]} > 0)); then
+    kill -TERM "${pids[@]}" 2>/dev/null
+    wait "${pids[@]}" 2>/dev/null
+  fi
+
+  echo >&2
+  output "ERROR: Interrupted." >&2
+  exit "${1}"
+}
+
+# Print the most useful line of a tool's error output.
+function error_summary() {
+  local summary
+
+  summary=$(grep -E '^[[:alnum:]_.]*(Error|error): ' <<<"${1}" | tail -n 1)
+  [[ -n "${summary}" ]] || summary=$(tail -n 1 <<<"${1}")
+
+  printf '%s\n' "${summary}"
 }
 
 function usage() {
@@ -60,7 +102,11 @@ function rclone_sync() {
   output_command "${command[@]}"
   echo
 
-  "${command[@]}" || status=$?
+  # Run rclone in the background and wait for it, so the INT/TERM traps run
+  # straight away instead of after the sync. Output still goes to the
+  # terminal as usual, and <&0 keeps stdin for prompts.
+  "${command[@]}" <&0 &
+  wait "${!}" || status=$?
   echo
 
   return "${status}"
@@ -120,6 +166,106 @@ function yaml_type() {
 
 function yaml_value() {
   yaml get-value "${1}"
+}
+
+# Print the non-empty string at a key, or fail. This rejects values YAML turns
+# into other types, such as null, yes, 1.10 or dates, and any control
+# character. Those are counted in shyaml's raw output, because the shell would
+# change the value: $(...) drops trailing newlines and NUL bytes ("Docs\n" and
+# "Doc\0s" would both become "Docs"), and a newline would split it into lines.
+function yaml_string() {
+  local controls
+  local value
+
+  [[ "$(yaml_type "${1}")" == str ]] || return 1
+  controls=$(yaml_value "${1}" | LC_ALL=C tr -dc '\000-\037\177' | wc -c) || return 1
+  ((controls == 0)) || return 1
+  value=$(yaml_value "${1}") || return 1
+  [[ -n "${value}" ]] || return 1
+
+  printf '%s\n' "${value}"
+}
+
+# Print the keys of the mapping at $1, one per line, or fail. Failing closed
+# matters: if shyaml itself failed, a key would look missing, and a missing
+# leafs key means syncing the whole remote.
+function yaml_keys() {
+  local keys
+
+  [[ "$(yaml_type "${1}")" == struct ]] || return 1
+  keys=$(yaml keys-0 "${1}" | tr '\0' '\n') || return 1
+
+  printf '%s\n' "${keys}"
+}
+
+# Print the keys in $1 (one per line) that are not listed in the other arguments.
+function unknown_keys() {
+  local allowed
+  local key
+  local unknown=""
+
+  while IFS= read -r key; do
+    [[ -n "${key}" ]] || continue
+    for allowed in "${@:2}"; do
+      [[ "${key}" == "${allowed}" ]] && continue 2
+    done
+    unknown+="${unknown:+, }${key}"
+  done <<<"${1}"
+
+  printf '%s\n' "${unknown}"
+}
+
+# Print the remote name at a key, without a trailing colon, or fail unless it
+# is a remote in the rclone config. Anything else would fail mid-run, or be
+# taken by rclone as a local path (e.g. "/Volumes/Backup:").
+function yaml_remote() {
+  local remote
+
+  remote=$(yaml_string "${1}") || return 1
+  remote=${remote%:}
+  [[ -n "${remote}" ]] && grep -qxF -- "${remote}:" <<<"${REMOTES}" || return 1
+
+  printf '%s\n' "${remote}"
+}
+
+# True for a leaf with a single spelling: relative, with no ".", ".." or empty
+# parts, so overlapping paths are caught (rclone reads "x:." as "x:", and
+# "x:./Docs" or "x:/Docs" as "x:Docs").
+function valid_leaf() {
+  case "/${1}/" in
+    //* | *//* | */./* | */../*) return 1 ;;
+  esac
+}
+
+# True if one rclone path is the same as, or inside, the other.
+function paths_overlap() {
+  local a="${1}"
+  local b="${2}"
+
+  [[ "${a}" == "${b}" ]] && return 0
+  [[ "${a}" == *: && "${b}" == "${a}"* ]] && return 0
+  [[ "${b}" == *: && "${a}" == "${b}"* ]] && return 0
+  [[ "${b}" == "${a}/"* || "${a}" == "${b}/"* ]]
+}
+
+function config_error() {
+  output "ERROR: ${TREE_YAML}: ${1}" >&2
+  config_errors=$((config_errors + 1))
+}
+
+# Queue a sync, skipping exact duplicates.
+function plan_sync() {
+  local i
+
+  for ((i = 0; i < ${#SOURCES[@]}; i++)); do
+    if [[ "${SOURCES[i]}" == "${1}" && "${DESTINATIONS[i]}" == "${2}" ]]; then
+      warn "Skipping duplicate sync ${1} -> ${2}."
+      return 0
+    fi
+  done
+
+  SOURCES+=("${1}")
+  DESTINATIONS+=("${2}")
 }
 
 RCLONE_BIN=rclone
@@ -205,81 +351,142 @@ declare -a RCLONE_ARGS=(
 # Progress redraws the terminal, so only show it when stdout is one.
 [[ "${RCLONE_PROGRESS}" == true && -t 1 ]] && RCLONE_ARGS+=(--progress)
 
-[[ "$(yaml_type tree)" == sequence ]] || fail "Unable to parse a tree list from ${TREE_YAML}."
+# Let rclone check the binary and every option once, before any sync starts.
+if ! preflight=$("${RCLONE_BIN}" "${RCLONE_ARGS[@]}" version 2>&1); then
+  fail "rclone rejected the options: $(error_summary "${preflight}")"
+fi
+
+# Remote names are checked against this list. stderr is left alone so rclone
+# can show errors, or ask for the password of an encrypted config.
+REMOTES=$("${RCLONE_BIN}" --config="${RCLONE_CONFIG}" listremotes) ||
+  fail "Unable to list the remotes in ${RCLONE_CONFIG}."
+
+# Parse once with errors visible; later lookups hide expected missing-key errors.
+if ! tree_type=$("${SHYAML_BIN}" get-type tree <<<"${TREE_DATA}" 2>&1); then
+  fail "Unable to parse ${TREE_YAML}: $(error_summary "${tree_type}")"
+fi
+[[ "${tree_type}" == sequence ]] || fail "Unable to parse a tree list from ${TREE_YAML}."
 
 tree_length=$(yaml_length tree)
 ((tree_length > 0)) || fail "The rclone tree list is empty."
 
-trap 'echo >&2; output "ERROR: Interrupted." >&2; exit 130' INT TERM
-
-failures=0
-syncs=0
+# Check the whole tree and build the list of syncs before running any, so a
+# mistake in the file (a misspelled "leafs" would otherwise sync the whole
+# remote) stops the run before anything is synced.
+config_errors=0
+declare -a SOURCES=()
+declare -a DESTINATIONS=()
 
 for ((t = 0; t < tree_length; t++)); do
-  trunk=$(yaml_value "tree.${t}.trunk")
-  trunk=${trunk%:}
-  branch_length=$(yaml_length "tree.${t}.branches")
+  entry="tree.${t}"
+  if ! keys=$(yaml_keys "${entry}"); then
+    config_error "${entry} must be a mapping with trunk and branches."
+    continue
+  fi
+  unknown=$(unknown_keys "${keys}" trunk branches)
+  [[ -z "${unknown}" ]] || config_error "${entry} has unknown key(s): ${unknown}"
 
-  if [[ -z "${trunk}" ]]; then
-    warn "The rclone trunk is not defined, skipping."
+  if ! trunk=$(yaml_remote "${entry}.trunk"); then
+    config_error "${entry}.trunk must be a remote from ${RCLONE_CONFIG}."
     continue
   fi
 
+  branch_length=0
+  if [[ "$(yaml_type "${entry}.branches")" == sequence ]]; then
+    branch_length=$(yaml_length "${entry}.branches")
+  fi
   if ((branch_length == 0)); then
-    warn "The rclone tree for ${trunk} has no branches, skipping."
+    config_error "${entry}.branches for ${trunk} must be a non-empty list."
     continue
   fi
 
   for ((b = 0; b < branch_length; b++)); do
-    branch=$(yaml_value "tree.${t}.branches.${b}.name")
-    branch=${branch%:}
+    entry="tree.${t}.branches.${b}"
+    if ! keys=$(yaml_keys "${entry}"); then
+      config_error "${entry} must be a mapping with a name."
+      continue
+    fi
+    unknown=$(unknown_keys "${keys}" name leafs)
+    if [[ -n "${unknown}" ]]; then
+      config_error "${entry} has unknown key(s): ${unknown}"
+      continue
+    fi
 
-    if [[ -z "${branch}" ]]; then
-      warn "The rclone branch has no name in ${trunk}, skipping."
+    if ! branch=$(yaml_remote "${entry}.name"); then
+      config_error "${entry}.name must be a remote from ${RCLONE_CONFIG}."
       continue
     fi
 
     if [[ "${branch}" == "${trunk}" ]]; then
-      warn "The rclone branch ${branch} is the same as its trunk, skipping."
+      config_error "${entry} syncs ${trunk} to itself."
       continue
     fi
 
-    leafs_key="tree.${t}.branches.${b}.leafs"
-    leafs_type=$(yaml_type "${leafs_key}")
-
-    # Only a missing leafs key syncs the whole remote; a malformed one is skipped.
-    if [[ -z "${leafs_type}" ]]; then
-      syncs=$((syncs + 1))
-      rclone_sync "${trunk}:" "${branch}:" || failures=$((failures + 1))
+    # Without a leafs key, the branch gets the whole trunk remote. Whether
+    # it has one comes from the key list, never from a failed lookup.
+    if ! grep -qxF leafs <<<"${keys}"; then
+      plan_sync "${trunk}:" "${branch}:"
       continue
     fi
 
-    leafs=()
-
-    if [[ "${leafs_type}" == sequence ]]; then
-      while IFS= read -r -d '' leaf; do
-        leafs+=("${leaf}")
-      done < <(yaml get-values-0 "${leafs_key}")
+    leafs_key="${entry}.leafs"
+    leaf_length=0
+    if [[ "$(yaml_type "${leafs_key}")" == sequence ]]; then
+      leaf_length=$(yaml_length "${leafs_key}")
     fi
-
-    if ((${#leafs[@]} == 0)); then
-      warn "The rclone leafs for ${trunk} -> ${branch} must be a non-empty list, skipping."
+    if ((leaf_length == 0)); then
+      config_error "${leafs_key} for ${trunk} -> ${branch} must be a non-empty list."
       continue
     fi
-
-    for leaf in "${leafs[@]}"; do
-      if [[ -z "${leaf}" ]]; then
-        warn "The rclone leaf is not defined in ${trunk} -> ${branch}, skipping."
+    for ((l = 0; l < leaf_length; l++)); do
+      if ! leaf=$(yaml_string "${leafs_key}.${l}"); then
+        config_error "${leafs_key}.${l} must be a non-empty string."
         continue
       fi
-
-      syncs=$((syncs + 1))
-      rclone_sync "${trunk}:${leaf}" "${branch}:${leaf}" || failures=$((failures + 1))
+      leaf=${leaf%/}
+      if ! valid_leaf "${leaf}"; then
+        config_error "${leafs_key}.${l} must be a relative path without '.', '..' or empty parts: ${leaf}"
+        continue
+      fi
+      plan_sync "${trunk}:${leaf}" "${branch}:${leaf}"
     done
   done
 done
 
-((syncs > 0)) || fail "No rclone sync commands were run."
+# rclone sync makes each destination match its source, deleting anything else,
+# so syncs must not write to overlapping places or read from a remote that
+# another sync writes to; otherwise the result depends on their order.
+chained=""
+for ((i = 0; i < ${#DESTINATIONS[@]}; i++)); do
+  for ((j = i + 1; j < ${#DESTINATIONS[@]}; j++)); do
+    if paths_overlap "${DESTINATIONS[i]}" "${DESTINATIONS[j]}"; then
+      config_error "${SOURCES[i]} -> ${DESTINATIONS[i]} and ${SOURCES[j]} -> ${DESTINATIONS[j]} write to overlapping paths."
+    fi
+  done
+  remote=${DESTINATIONS[i]%%:*}
+  # Report each remote once (remote names may contain spaces, hence lines).
+  grep -qxF -- "${remote}" <<<"${chained}" && continue
+  for ((j = 0; j < ${#SOURCES[@]}; j++)); do
+    if [[ "${remote}" == "${SOURCES[j]%%:*}" ]]; then
+      config_error "${remote} is both synced to and synced from."
+      chained+="${remote}"$'\n'
+      break
+    fi
+  done
+done
+
+((config_errors == 0)) || fail "Found ${config_errors} problem(s) in ${TREE_YAML}; nothing was synced."
+
+trap 'interrupted 130' INT
+trap 'interrupted 143' TERM
+
+failures=0
+syncs=${#SOURCES[@]}
+
+for ((i = 0; i < syncs; i++)); do
+  rclone_sync "${SOURCES[i]}" "${DESTINATIONS[i]}" || failures=$((failures + 1))
+done
+
 ((failures == 0)) || fail "${failures} of ${syncs} rclone sync command(s) failed."
 
 output "Completed ${syncs} rclone sync command(s)."

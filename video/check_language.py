@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import mimetypes
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,16 +9,27 @@ from pymediainfo import MediaInfo
 from tabulate import tabulate
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib.env import positive_int
 from lib.output import spinner, status
 from lib.runtime import run
 
 ENGLISH = {"en", "eng"}
-mimetypes.add_type("video/mp2t", ".m2ts")
-
-try:
-    WORKERS = max(1, int(os.environ.get("WORKERS", "8")))
-except ValueError:
-    WORKERS = 8
+DEFAULT_WORKERS = 8
+WORKERS_VARIABLE = "CHECK_LANGUAGE_WORKERS"
+# An explicit list, because mimetypes reads the OS's mime.types files and
+# their mappings differ (Debian maps .ts to Qt Linguist translations).
+VIDEO_EXTENSIONS = {
+    ".3g2", ".3gp", ".asf", ".avi", ".divx", ".dv", ".f4v", ".flv", ".m1v",
+    ".m2ts", ".m2v", ".m4v", ".mkv", ".mov", ".mp4", ".mpe", ".mpeg", ".mpg",
+    ".mts", ".ogm", ".ogv", ".qt", ".rm", ".rmvb", ".ts", ".vob", ".webm",
+    ".wmv", ".wtv",
+}  # fmt: skip
+# These are also TypeScript source extensions, so their contents are checked.
+TRANSPORT_STREAM_EXTENSIONS = {".mts", ".ts"}
+# MPEG transport stream packets start with a sync byte: 188-byte packets at
+# offset 0, or 192-byte Blu-ray (M2TS) packets after a 4-byte timestamp.
+TS_SYNC_BYTE = 0x47
+TS_LAYOUTS = ((0, 188), (4, 192))
 
 
 def probe_languages(file: Path) -> tuple[str, list[str]] | None:
@@ -47,14 +57,37 @@ def needs_attention(default_lang: str, languages: list[str]) -> bool:
     return any(not is_english(lang) for lang in languages)
 
 
-def walk_files(directory: Path, errors: list[str]) -> list[Path]:
+def is_transport_stream(head: bytes) -> bool:
+    """True if head starts like a transport stream (first two sync bytes)."""
+    return any(
+        len(head) > offset
+        and head[offset] == TS_SYNC_BYTE
+        and (len(head) <= offset + size or head[offset + size] == TS_SYNC_BYTE)
+        for offset, size in TS_LAYOUTS
+    )
+
+
+def is_video(path: Path) -> bool:
+    suffix = path.suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        return False
+    if suffix not in TRANSPORT_STREAM_EXTENSIONS:
+        return True
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(max(offset + size for offset, size in TS_LAYOUTS) + 1)
+    except OSError:
+        return True  # let the probe report the error
+    return is_transport_stream(head)
+
+
+def walk_files(directory: Path, errors: list[OSError]) -> list[Path]:
     files = []
-    for root, _dirs, names in os.walk(
-        directory, onerror=lambda e: errors.append(str(e))
-    ):
+    for root, _dirs, names in os.walk(directory, onerror=errors.append):
         for name in names:
-            if (mimetypes.guess_type(name)[0] or "").startswith("video/"):
-                files.append(Path(root) / name)
+            path = Path(root) / name
+            if is_video(path):
+                files.append(path)
     return files
 
 
@@ -65,6 +98,7 @@ def main() -> int:
     if not MediaInfo.can_parse():
         status("ERROR: the libmediainfo library was not found")
         return 1
+    workers = positive_int(WORKERS_VARIABLE, DEFAULT_WORKERS)
     rows = []
     errors = 0
     scanned = 0
@@ -77,8 +111,10 @@ def main() -> int:
             print("\r\033[K", end="", file=sys.stderr)
         status(f"ERROR: {message}")
 
-    files = []
+    # Show each file relative to the directory argument it was found under.
+    display: dict[Path, str] = {}
     seen = set()
+    reported_walk_errors: set[str] = set()
     for argument in sys.argv[1:]:
         try:
             directory = Path(argument).resolve()
@@ -91,18 +127,32 @@ def main() -> int:
         if not directory.is_dir():
             report_error(f"not a directory: {argument}")
             continue
-        walk_errors: list[str] = []
-        with spinner(f"Scanning {directory}"):
-            files.extend(walk_files(directory, walk_errors))
-        for message in walk_errors:
-            report_error(message)
 
-    files = sorted(set(files))
+        def shown(path: Path, argument=argument, directory=directory) -> str:
+            return str(Path(argument) / path.relative_to(directory))
+
+        walk_errors: list[OSError] = []
+        with spinner(f"Scanning {argument}"):
+            found = walk_files(directory, walk_errors)
+        # Overlapping arguments walk the same directories; report each once.
+        for exc in walk_errors:
+            key = exc.filename or str(exc)
+            if key in reported_walk_errors:
+                continue
+            reported_walk_errors.add(key)
+            if exc.filename:
+                report_error(f"{shown(Path(exc.filename))}: {exc.strerror or exc}")
+            else:
+                report_error(str(exc))
+        for file in found:
+            display.setdefault(file, shown(file))
+
+    files = sorted(display)
     total = len(files)
     status(f"Found {total} file(s) to check")
     is_tty = sys.stderr.isatty()
     done = 0
-    pool = ThreadPoolExecutor(max_workers=WORKERS)
+    pool = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = {pool.submit(probe_languages, file): file for file in files}
         for future in as_completed(futures):
@@ -112,8 +162,9 @@ def main() -> int:
                 print(f"\r[*]: [{done}/{total}]", end="", file=sys.stderr)
             try:
                 probed = future.result()
-            except (OSError, RuntimeError, ValueError) as exc:
-                report_error(f"{file}: {exc}")
+            except Exception as exc:  # noqa: BLE001 - keep scanning
+                # One unreadable file should not end the whole scan.
+                report_error(f"{display[file]}: {exc}")
                 continue
             if probed is None:
                 skipped += 1
@@ -121,9 +172,11 @@ def main() -> int:
             scanned += 1
             default_lang, languages = probed
             if needs_attention(default_lang, languages):
-                rows.append((default_lang, ",".join(languages) or "-", file.name))
+                rows.append((default_lang, ",".join(languages), display[file]))
     finally:
-        pool.shutdown(cancel_futures=True)
+        # Don't wait for in-flight probes (e.g. on Ctrl-C); run() exits the
+        # process with os._exit, which does not join worker threads.
+        pool.shutdown(wait=False, cancel_futures=True)
         if is_tty:
             print("\r\033[K", end="", file=sys.stderr)
     rows.sort(key=lambda row: row[2])
