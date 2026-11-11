@@ -288,20 +288,30 @@ class TreeTests(unittest.TestCase):
                     "c is both synced to and synced from",
                 )
 
-    def test_multiline_names_and_leafs_are_rejected(self):
+    def test_control_characters_are_rejected(self):
+        # The shell would silently change these values: $(...) drops trailing
+        # newlines and NULs, so "d\\n" would pass as the remote d, and
+        # "Docs\\n" or "Doc\\0s" as the leaf Docs.
         result = self.run_tree("""\
             tree:
               - trunk: a
                 branches:
                   - name: "b\\nc"
+                  - name: "d\\n"
                   - name: c
-                    leafs: ["x\\ny"]
+                    leafs: ["x\\ny", "Docs\\n", "Doc\\0s", "Do\\tcs", "Döcs"]
             """)
         self.assert_fails_without_syncing(
             result,
             "tree.0.branches.0.name must be a remote from",
-            "tree.0.branches.1.leafs.0 must be a non-empty string",
+            "tree.0.branches.1.name must be a remote from",
+            *(
+                f"tree.0.branches.2.leafs.{i} must be a non-empty string"
+                for i in range(4)
+            ),
+            "Found 6 problem(s)",
         )
+        self.assertNotIn("leafs.4", result.stderr)  # non-ASCII is fine
 
     def test_nested_leafs_overlap(self):
         for leafs, message in (

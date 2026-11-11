@@ -168,14 +168,20 @@ function yaml_value() {
   yaml get-value "${1}"
 }
 
-# Print the non-empty, single-line string at a key, or fail. This rejects
-# values YAML turns into other types, such as null, yes, 1.10 or dates.
+# Print the non-empty string at a key, or fail. This rejects values YAML turns
+# into other types, such as null, yes, 1.10 or dates, and any control
+# character. Those are counted in shyaml's raw output, because the shell would
+# change the value: $(...) drops trailing newlines and NUL bytes ("Docs\n" and
+# "Doc\0s" would both become "Docs"), and a newline would split it into lines.
 function yaml_string() {
+  local controls
   local value
 
   [[ "$(yaml_type "${1}")" == str ]] || return 1
+  controls=$(yaml_value "${1}" | LC_ALL=C tr -dc '\000-\037\177' | wc -c) || return 1
+  ((controls == 0)) || return 1
   value=$(yaml_value "${1}") || return 1
-  [[ -n "${value}" && "${value}" != *$'\n'* ]] || return 1
+  [[ -n "${value}" ]] || return 1
 
   printf '%s\n' "${value}"
 }
